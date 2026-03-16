@@ -23,7 +23,12 @@ def get_encoder_chain(can_interface: CanInterface) -> EncoderChain:
 def get_yam_robot(
     channel: str = "can0",
     gripper_type: GripperType = GripperType.CRANK_4310,
-    zero_gravity_mode:bool = True,
+    zero_gravity_mode: bool = True,
+    kp_override: np.ndarray | None = None,
+    kd_override: np.ndarray | None = None,
+    gravity_comp_factor: float = 1.3,
+    gripper_limits_override: np.ndarray | None = None,
+    limit_gripper_force: float = 50.0,
 ) -> MotorChainRobot:
     with_gripper = True
     with_teaching_handle = False
@@ -108,25 +113,31 @@ def get_yam_robot(
     )
     motor_states = motor_chain.read_states()
     logging.info(f"YAM initial motor_states: {motor_states}")
+
+    final_kp = kp_override if kp_override is not None else kp
+    final_kd = kd_override if kd_override is not None else kd
+
     get_robot = partial(
         MotorChainRobot,
         motor_chain=motor_chain,
         xml_path=model_path,
         use_gravity_comp=True,
-        gravity_comp_factor=1.3,
+        gravity_comp_factor=gravity_comp_factor,
         joint_limits=joint_limits,
-        kp=kp,
-        kd=kd,
+        kp=final_kp,
+        kd=final_kd,
         zero_gravity_mode=zero_gravity_mode,
     )
 
     if with_gripper:
+        gripper_limits = gripper_limits_override if gripper_limits_override is not None else gripper_type.get_gripper_limits()
+        enable_cal = gripper_limits is None and gripper_type.get_gripper_needs_calibration()
         return get_robot(
             gripper_index=6,
-            gripper_limits=gripper_type.get_gripper_limits(),
-            enable_gripper_calibration=gripper_type.get_gripper_needs_calibration(),
+            gripper_limits=gripper_limits,
+            enable_gripper_calibration=enable_cal,
             gripper_type=gripper_type,
-            limit_gripper_force=50.0,
+            limit_gripper_force=limit_gripper_force,
         )
     else:
         return get_robot()
