@@ -459,6 +459,47 @@ class MotorChainRobot(Robot):
             self._commands.kp = kp
             self._commands.kd = kd
 
+    def command_joint_torque(
+        self,
+        torque: np.ndarray,
+        kp: Optional[np.ndarray] = None,
+        kd: Optional[np.ndarray] = None,
+        pos: Optional[np.ndarray] = None,
+    ) -> None:
+        """Command a feedforward joint torque (added on top of gravity compensation).
+
+        update() sends each motor:
+            tau_motor = kp * (pos_cmd - q) + kd * (0 - qdot) + (torque + g(q) * gravity_comp_factor)
+        With the defaults (kp = 0) this is direct torque control on top of i2rt's
+        gravity compensation: pass torque = J^T @ F for Cartesian impedance and let
+        gravity be handled here. Provide a per-joint kd for velocity damping
+        (recommended for stability). To keep some joints position-held (e.g. the
+        gripper) pass a nonzero kp[idx] and the desired pos[idx].
+
+        NOTE: torque is in robot joint space (same space as the gravity term); for
+        YAM all motor directions are +1 so J^T @ F maps in directly with no remap.
+
+        Args:
+            torque: feedforward torque per joint, length == num motors (arm + gripper).
+            kp: per-joint position gain (default all zero -> pure torque/impedance).
+            kd: per-joint velocity damping (default all zero).
+            pos: per-joint position target used with kp (default = current joint pos).
+        """
+        n = len(self.motor_chain)
+        torque = np.asarray(torque, dtype=float)
+        assert torque.shape == (n,), f"torque must be length {n}, got {torque.shape}"
+        kp = np.zeros(n) if kp is None else np.asarray(kp, dtype=float)
+        kd = np.zeros(n) if kd is None else np.asarray(kd, dtype=float)
+        assert kp.shape == (n,) and kd.shape == (n,), "kp/kd must be length n"
+        pos = self.get_joint_pos() if pos is None else np.asarray(pos, dtype=float)
+        pos = self._clip_robot_joint_pos_command(pos.copy())
+        with self._command_lock:
+            self._commands = JointCommands.init_all_zero(n)
+            self._commands.torques = torque
+            self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
+            self._commands.kp = kp
+            self._commands.kd = kd
+
     def zero_torque_mode(self) -> None:
         logging.info(f"Entering zero_torque_mode for {self}")
         with self._command_lock:
