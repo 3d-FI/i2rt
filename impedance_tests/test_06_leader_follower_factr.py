@@ -10,7 +10,9 @@ Control (follower, per cycle):
     enable   = ramp 0->1 over --fric-ramp seconds after engage
     tau_fric = friction_torque(qdot, tau_imp, params, enable)   # breakaway + viscous comp
     tau_arm  = clip(tau_imp + tau_fric, -(tau_clip+fric_max), +(tau_clip+fric_max))
-    command_joint_torque([tau_arm, gripper=0], kp=0 arm, kd=joint_damping, pos=hold gripper)
+    grip_des = leader teaching-handle trigger (normalized 0=closed .. 1=open)  # --no-grip-track to hold
+    command_joint_torque([tau_arm, gripper ff=0], kp=[0 arm, stock grip],
+                         kd=joint_damping, pos=[hold arm, grip_des])           # gripper tracks leader
 
 LOGGING: every run records a summary to --log (default factr_last_run.txt) with leader &
 follower joint travel, EE tracking-error stats, and per-joint diagnostics (stuck% /
@@ -220,6 +222,10 @@ def main() -> int:
                     choices=["crank_4310", "linear_3507", "linear_4310", "no_gripper"])
     ap.add_argument("--leader-gripper", default="yam_teaching_handle",
                     choices=["yam_teaching_handle", "crank_4310", "linear_3507", "linear_4310", "no_gripper"])
+    ap.add_argument("--no-grip-track", action="store_true",
+                    help="hold the follower gripper instead of tracking the leader trigger/gripper")
+    ap.add_argument("--grip-invert", action="store_true",
+                    help="invert the leader trigger -> follower gripper direction")
     ap.add_argument("--gcomp", default="1.0")
     ap.add_argument("--k-trans", default="120,120,120")
     ap.add_argument("--k-rot", default="15,15,15")
@@ -293,6 +299,36 @@ def main() -> int:
     def q_of(robot):
         return np.asarray(robot.get_observations()["joint_pos"], float)[:ARM_DOF]
 
+    # --- leader gripper / teaching-handle trigger -> follower gripper command (normalized 0=closed, 1=open) ---
+    track_gripper = (not args.no_grip_track) and (gripper_index is not None)
+    lead_is_handle = lead_grip == GripperType.YAM_TEACHING_HANDLE
+    lead_has_gripper = lead_grip not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
+
+    def read_leader_grip():
+        """Normalized leader gripper command in [0,1] (0=closed, 1=open), or None if unavailable.
+
+        Teaching handle: passive trigger encoder (cached by the leader's CAN thread), mapped
+        like scripts/minimum_gello.py (1 - position). Real leader gripper: its normalized
+        gripper_pos observation. --grip-invert flips the direction for hardware bring-up.
+        """
+        g = None
+        try:
+            if lead_is_handle:
+                st = leader.motor_chain.get_same_bus_device_states()
+                if st:
+                    g = 1.0 - float(st[0].position)
+            elif lead_has_gripper:
+                gp = leader.get_observations().get("gripper_pos")
+                if gp is not None:
+                    g = float(np.asarray(gp, float).flat[0])
+        except Exception:  # noqa: BLE001  (stale/missing read -> hold gripper this cycle)
+            return None
+        if g is None:
+            return None
+        if args.grip_invert:
+            g = 1.0 - g
+        return float(np.clip(g, 0.0, 1.0))
+
     def restiffen():
         try:
             follower.update_kp_kd(stock_kp, stock_kd)
@@ -348,6 +384,12 @@ def main() -> int:
 
     print(f"\n[Phase B] TRACKING (friction {'ON' if fric_on else 'OFF'}). Move the LEADER; follower follows.")
     print(f"  follower start EE {np.round(xf0_pos,3)}  (x_des clamped +-{args.workspace} m). Ctrl-C to stop.")
+    if track_gripper:
+        src = "teaching-handle trigger" if lead_is_handle else "leader gripper"
+        print(f"  gripper: {src} -> follower gripper{' (inverted)' if args.grip_invert else ''}. "
+              f"Squeeze/release the leader to close/open.")
+    else:
+        print("  gripper: HELD (use without --no-grip-track to teleop the gripper).")
     t0 = time.perf_counter()
     dt_print = 1.0 / max(args.rate, 0.5)
     dt_log = 1.0 / max(args.log_rate, 1.0)
@@ -383,6 +425,10 @@ def main() -> int:
                 ended = "guard"
                 restiffen(); break
 
+            grip_des = read_leader_grip() if track_gripper else None
+            if grip_des is not None:
+                full_pos[gripper_index] = grip_des  # follower gripper tracks the leader trigger
+
             torque_full = np.zeros(n_motors)
             torque_full[:ARM_DOF] = tau_arm
             follower.command_joint_torque(torque_full, kp=kp_full, kd=kd_full, pos=full_pos)
@@ -399,6 +445,11 @@ def main() -> int:
                 print("-" * 72)
                 print(f"leader EE {np.round(xl_pos,3)}  track_err {track*100:5.1f} cm")
                 print(f"tau_imp  {np.round(tau_imp,2)}   tau_fric {np.round(tau_fric,2)}")
+                if track_gripper:
+                    gf = follower.get_observations().get("gripper_pos")
+                    gf = float(np.asarray(gf, float).flat[0]) if gf is not None else float("nan")
+                    gd = grip_des if grip_des is not None else float("nan")
+                    print(f"gripper  des {gd:4.2f} -> follower {gf:4.2f}  (0=closed 1=open)")
                 next_print = now + dt_print
             time.sleep(0.005)
     except KeyboardInterrupt:
