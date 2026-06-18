@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """Test 06 — Leader-follower Cartesian impedance WITH FACTR friction compensation.
 
-Same as test_04 (leader's EE pose drives x_des; follower tracks it with Cartesian
-impedance), but adds:
-  - per-joint torque budget (real motor limits: DM4340 base/shoulder/elbow up to ~28 N*m,
-    DM4310 wrist ~10) instead of the flat 4 N*m clamp, and
-  - FACTR-style friction compensation (factr_friction.py) so the heavy shoulder/elbow
-    break loose from stiction and actually follow the leader.
+The leader's EE pose drives x_des; the follower tracks it with Cartesian impedance
+(per-joint torque budget) + FACTR friction comp so the heavy shoulder/elbow break
+loose and follow. See factr_friction.py for the friction law.
 
 Control (follower, per cycle):
-    tau_imp  = clip(J^T F, -tau_clip_vec, +tau_clip_vec)        # per-joint impedance clamp
+    tau_imp  = clip(J^T F, -tau_clip_vec, +tau_clip_vec)       # per-joint impedance clamp
     enable   = ramp 0->1 over --fric-ramp seconds after engage
-    tau_fric = friction_torque(qdot, tau_imp, params, enable)    # breakaway + viscous comp
+    tau_fric = friction_torque(qdot, tau_imp, params, enable)   # breakaway + viscous comp
     tau_arm  = clip(tau_imp + tau_fric, -(tau_clip+fric_max), +(tau_clip+fric_max))
     command_joint_torque([tau_arm, gripper=0], kp=0 arm, kd=joint_damping, pos=hold gripper)
-  (gravity g(q) is added on top by i2rt; friction comp never touches the gripper.)
 
-SAFETY: follower up STIFF, opt in with 'engage'; leader floats (read-only); x_des clamped
-to a workspace box; per-joint torque budget; friction enable ramps in; runaway guard on
-follower velocity and tracking error (also catches friction self-motion). Push/lead GENTLY.
-Ctrl-C re-stiffens the follower. SUPPORT BOTH ARMS before exit.
+LOGGING: every run records a summary to --log (default factr_last_run.txt) with leader &
+follower joint travel, EE tracking-error stats, and per-joint diagnostics (stuck% /
+clamp% / oscillation) plus tuning suggestions -- so the run can be analysed from the file
+without watching the arm.
 
 OFFLINE (no hardware):  python test_06_leader_follower_factr.py --selftest
-
-HARDWARE (after calibrating mu_c with test_05):
+HARDWARE:
   python test_06_leader_follower_factr.py --follower-can can_follower --leader-can can_leader \
-      --mu-c <paste from test_05> --mu-scale 0.5
+      --mu-c <from test_05> --mu-scale 0.5 --max-vel 3.0
 """
 
 from __future__ import annotations
@@ -36,23 +31,22 @@ import signal
 import sys
 import time
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
 sys.path.insert(0, _REPO)
+sys.path.insert(0, _HERE)
 
 import numpy as np  # noqa: E402
 import mujoco  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
-# friction module is in the same dir
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from factr_friction import (  # noqa: E402
-    FrictionParams, default_yam_params, default_tau_clip, friction_torque,
-    check_budget, friction_curve_demo, GRAVITY_MAX,
+    default_yam_params, default_tau_clip, friction_torque, check_budget, friction_curve_demo, GRAVITY_MAX,
 )
-
 from i2rt.robots.utils import GripperType  # noqa: E402
 
 ARM_DOF = 6
+JOINT_NAMES = ["base", "shoulder", "elbow", "wpitch", "wyaw", "wroll"]
 
 
 class MjKin:
@@ -92,7 +86,6 @@ def parse_vec(s, n, name):
 
 
 def selftest(xml_path: str) -> int:
-    """Offline: Jacobian finite-diff check + friction curve. No hardware."""
     print(f"[selftest] loading {xml_path}")
     kin = MjKin(xml_path)
     rng = np.random.default_rng(0)
@@ -113,6 +106,111 @@ def selftest(xml_path: str) -> int:
     return 0 if worst < 1e-3 else 1
 
 
+def write_summary(path, cfg, rec, tau_clip_vec, fric_on, ended):
+    """Compute a human+machine readable run summary and write it to `path`."""
+    L = []
+    def emit(s=""):
+        L.append(s)
+    n = len(rec["t"])
+    emit("================== FACTR leader-follower run summary ==================")
+    emit(f"ended: {ended}    logged samples: {n}")
+    if n < 5:
+        emit("(too few samples for stats)")
+        txt = "\n".join(L) + "\n"
+        with open(path, "w") as f:
+            f.write(txt)
+        print("\n" + txt)
+        return
+    t = np.array(rec["t"]); dur = max(t[-1] - t[0], 1e-6)
+    ql = np.array(rec["ql"]); qf = np.array(rec["qf"])
+    xl = np.array(rec["xl"]); xf = np.array(rec["xf"])
+    perr = np.array(rec["perr"]); rerr = np.array(rec["rerr"])
+    ti = np.array(rec["ti"]); tf = np.array(rec["tf"]); qd = np.array(rec["qd"])
+    track_cm = np.linalg.norm(perr, axis=1) * 100.0
+    r2d = 180.0 / np.pi
+
+    emit(f"duration: {dur:.1f} s    sample rate ~{n / dur:.0f} Hz")
+    emit("")
+    emit("CONFIG:")
+    for k, v in cfg.items():
+        emit(f"  {k} = {v}")
+    emit("")
+    emit("LEADER EE travel (cm):   x %5.1f  y %5.1f  z %5.1f" % tuple((xl.max(0) - xl.min(0)) * 100))
+    emit("FOLLOWER EE travel (cm): x %5.1f  y %5.1f  z %5.1f" % tuple((xf.max(0) - xf.min(0)) * 100))
+    emit("")
+    emit("EE TRACKING ERROR (cm):  mean %.1f  median %.1f  p95 %.1f  max %.1f" % (
+        track_cm.mean(), np.percentile(track_cm, 50), np.percentile(track_cm, 95), track_cm.max()))
+    emit("  per-axis |pos err| (cm): x mean %.1f/max %.1f | y mean %.1f/max %.1f | z mean %.1f/max %.1f" % (
+        np.abs(perr[:, 0]).mean() * 100, np.abs(perr[:, 0]).max() * 100,
+        np.abs(perr[:, 1]).mean() * 100, np.abs(perr[:, 1]).max() * 100,
+        np.abs(perr[:, 2]).mean() * 100, np.abs(perr[:, 2]).max() * 100))
+    rn = np.linalg.norm(rerr, axis=1)
+    emit("  orientation err (rad):   mean %.2f  max %.2f" % (rn.mean(), rn.max()))
+    emit("")
+    emit("PER-JOINT (arm):  lead_range/fol_range (deg) | tau_imp mean/max | tau_fric mean | stuck%% | clamp%% | osc/s")
+    stuck = np.zeros(ARM_DOF); clamp = np.zeros(ARM_DOF); osc = np.zeros(ARM_DOF)
+    for j in range(ARM_DOF):
+        lr = (ql[:, j].max() - ql[:, j].min()) * r2d
+        fr = (qf[:, j].max() - qf[:, j].min()) * r2d
+        ai = np.abs(ti[:, j]); af = np.abs(tf[:, j]); ad = np.abs(qd[:, j])
+        stuck[j] = float(np.mean((ai > 0.5) & (ad < 0.05)))      # commanded but not moving
+        clamp[j] = float(np.mean(ai >= 0.95 * tau_clip_vec[j]))  # impedance at clamp
+        sv = np.sign(qd[:, j]); sv[ad < 0.05] = 0; nz = sv[sv != 0]
+        rev = int(np.sum(np.diff(nz) != 0)) if len(nz) > 1 else 0
+        osc[j] = rev / dur
+        emit("  J%d %-8s %5.1f / %5.1f | %.2f / %.2f | %.2f | %3.0f%% | %3.0f%% | %.1f" % (
+            j, JOINT_NAMES[j], lr, fr, ai.mean(), ai.max(), af.mean(), stuck[j] * 100, clamp[j] * 100, osc[j]))
+    # Hold stability: does the follower keep moving while the leader is held still?
+    leadspd = np.linalg.norm(np.diff(xl, axis=0), axis=1) / np.maximum(np.diff(t), 1e-3)
+    qd_al = np.abs(qd[1:]); still = leadspd < 0.02
+    emit("")
+    if int(still.sum()) >= 5:
+        qd_still = qd_al[still]
+        moving_frac = float(np.mean(np.max(qd_still, axis=1) > 0.1))
+        pj_hold = qd_still.mean(axis=0)
+        emit("HOLD STABILITY (leader <2 cm/s for %.0f%% of run):" % (100 * still.mean()))
+        emit("  follower still moving (any arm joint >0.1 rad/s): %.0f%% of held samples" % (100 * moving_frac))
+        emit("  mean follower |joint vel| while held (rad/s): " +
+             "  ".join("%s %.2f" % (JOINT_NAMES[j], pj_hold[j]) for j in range(ARM_DOF)))
+    else:
+        moving_frac = 0.0; pj_hold = np.zeros(ARM_DOF)
+        emit("HOLD STABILITY: not enough leader-still time to assess (hold the leader still a few times next run)")
+    emit("")
+    emit("TUNING SUGGESTIONS:")
+    sugg = []
+    if int(still.sum()) >= 5 and moving_frac > 0.25:
+        w = int(np.argmax(pj_hold))
+        fix = ("raise its kd / lower K_rot" if w >= 3 else "lower mu_c or raise --v-eps")
+        sugg.append(f"  HOLD-STABILITY: follower moves {moving_frac*100:.0f}% of the time the leader is held still "
+                    f"(most active: J{w} {JOINT_NAMES[w]}) -> {fix}")
+    for j in range(ARM_DOF):
+        if stuck[j] > 0.15:
+            extra = " (also at clamp -> raise tau_clip/K)" if clamp[j] > 0.2 else ""
+            sugg.append(f"  J{j} {JOINT_NAMES[j]}: STUCK {stuck[j]*100:.0f}% (torque commanded, joint not moving) "
+                        f"-> raise mu_c[{j}] (more friction comp){extra}")
+        elif clamp[j] > 0.25:
+            sugg.append(f"  J{j} {JOINT_NAMES[j]}: impedance SATURATING clamp {clamp[j]*100:.0f}% "
+                        f"-> raise tau_clip[{j}] or K (more authority)")
+        if fric_on and osc[j] > 3.0 and tf[:, j].std() > 0.05:
+            sugg.append(f"  J{j} {JOINT_NAMES[j]}: OSCILLATING {osc[j]:.1f} rev/s with active friction comp "
+                        f"-> lower mu_c[{j}] (likely over-compensated)")
+    p95 = np.percentile(track_cm, 95)
+    if not sugg:
+        if p95 < 4:
+            sugg.append("  Tracking looks GOOD: no joint stuck/saturating/oscillating, EE p95 < 4 cm. Gains OK.")
+        else:
+            sugg.append(f"  EE p95 {p95:.1f} cm is a bit high but no joint is clearly stuck -- "
+                        f"raise K_trans for snappier tracking, or move the leader slower.")
+    for s in sugg:
+        emit(s)
+    emit("=" * 70)
+    txt = "\n".join(L) + "\n"
+    with open(path, "w") as f:
+        f.write(txt)
+    print("\n" + txt)
+    print(f"[summary written to {path}]")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="YAM leader-follower Cartesian impedance + FACTR friction comp")
     ap.add_argument("--selftest", action="store_true", help="offline Jacobian + friction-curve check, no CAN")
@@ -124,19 +222,24 @@ def main() -> int:
                     choices=["yam_teaching_handle", "crank_4310", "linear_3507", "linear_4310", "no_gripper"])
     ap.add_argument("--gcomp", default="1.0")
     ap.add_argument("--k-trans", default="120,120,120")
-    ap.add_argument("--k-rot", default="6,6,6")
+    ap.add_argument("--k-rot", default="15,15,15")
     ap.add_argument("--d-trans", default="0,0,0")
     ap.add_argument("--d-rot", default="0,0,0")
-    ap.add_argument("--kd", default="3,3,3,2,1,1", help="follower joint damping floor (<=5)")
-    ap.add_argument("--tau-clip", default=None, help="per-joint impedance clamp (6 vals); default = factr_friction.default_tau_clip()")
+    ap.add_argument("--kd", default="3,4.5,4.5,3,2,2", help="follower joint damping floor (<=5)")
+    ap.add_argument("--tau-clip", default=None, help="per-joint impedance clamp (6 vals); default = default_tau_clip()")
     ap.add_argument("--mu-c", default=None, help="per-joint Coulomb friction (6 vals); default from factr_friction")
-    ap.add_argument("--mu-scale", type=float, default=0.5, help="scale applied to mu_c (stay below true breakaway)")
+    ap.add_argument("--mu-scale", type=float, default=0.5, help="scale applied to mu_c")
+    ap.add_argument("--v-eps", type=float, default=None,
+                    help="friction-comp velocity scale (higher = gentler slope, more stable vs limit cycle; default 0.05)")
     ap.add_argument("--fric-ramp", type=float, default=2.0, help="seconds to fade friction comp in after engage")
-    ap.add_argument("--no-friction", action="store_true", help="disable friction comp (A/B vs test_04 + per-joint clamp)")
+    ap.add_argument("--no-friction", action="store_true", help="disable friction comp (A/B vs clamp only)")
     ap.add_argument("--workspace", type=float, default=0.25, help="half-size of x_des box around engage (m)")
-    ap.add_argument("--max-vel", type=float, default=2.0, help="guard: follower joint vel rad/s")
+    ap.add_argument("--max-vel", type=float, default=3.0, help="guard: follower joint vel rad/s")
     ap.add_argument("--max-track", type=float, default=0.3, help="guard: tracking error (m) before abort")
-    ap.add_argument("--rate", type=float, default=4.0)
+    ap.add_argument("--rate", type=float, default=4.0, help="console print rate (Hz)")
+    ap.add_argument("--log", default=os.path.join(_HERE, "factr_last_run.txt"),
+                    help="path for the run summary (.txt)")
+    ap.add_argument("--log-rate", type=float, default=30.0, help="sample rate (Hz) for the run log/summary stats")
     args = ap.parse_args()
 
     fol_grip = GripperType(args.follower_gripper)
@@ -149,12 +252,12 @@ def main() -> int:
     D = np.concatenate([parse_vec(args.d_trans, 3, "d-trans"), parse_vec(args.d_rot, 3, "d-rot")])
     arm_kd = parse_vec(args.kd, ARM_DOF, "kd")
     tau_clip_vec = default_tau_clip() if args.tau_clip is None else parse_vec(args.tau_clip, ARM_DOF, "tau-clip")
-
-    # Friction params: defaults, optionally override mu_c with calibrated values, then scale.
     fp = default_yam_params()
     if args.mu_c is not None:
         fp.mu_c = parse_vec(args.mu_c, ARM_DOF, "mu-c")
     fp.mu_c = fp.mu_c * args.mu_scale
+    if args.v_eps is not None:
+        fp.v_eps = np.full(ARM_DOF, args.v_eps)
     fric_on = not args.no_friction
 
     kin = MjKin(xml_path)
@@ -162,10 +265,9 @@ def main() -> int:
     print("=" * 72)
     print("YAM leader-follower Cartesian impedance + FACTR friction comp")
     print(f"  follower: {args.follower_can} ({args.follower_gripper})   leader: {args.leader_can} ({args.leader_gripper})")
-    print(f"  K={K}")
-    print(f"  tau_clip(per-joint)={tau_clip_vec}")
-    print(f"  friction {'ON' if fric_on else 'OFF'}  mu_c(scaled)={np.round(fp.mu_c,2)}  fric_max={fp.fric_max}  ramp={args.fric_ramp}s")
-    print(f"  joint kd={arm_kd}  max_vel={args.max_vel}  workspace=+-{args.workspace}m")
+    print(f"  K={K}   tau_clip={tau_clip_vec}")
+    print(f"  friction {'ON' if fric_on else 'OFF'}  mu_c(eff)={np.round(fp.mu_c,2)}  kd={arm_kd}  max_vel={args.max_vel}")
+    print(f"  run summary -> {args.log}")
     print("=" * 72)
     print(">>> Keep a hand near BOTH arms. Lead GENTLY first. Ctrl-C re-stiffens follower. <<<")
     input("Press Enter to connect to both arms...")
@@ -199,12 +301,10 @@ def main() -> int:
             print(f"  (restiffen warning: {e})")
 
     def on_sigint(signum, frame):  # noqa: ARG001
-        print("\nCtrl-C — re-stiffening follower. SUPPORT BOTH ARMS.")
-        restiffen(); time.sleep(0.3); sys.exit(0)
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, on_sigint)
 
-    # ---- Phase A ----
     print("\n[Phase A] Follower stiff, leader floating. Move the leader where you like.")
     t_end = time.perf_counter() + 5.0
     while time.perf_counter() < t_end:
@@ -213,11 +313,13 @@ def main() -> int:
         time.sleep(0.1)
     print()
 
-    ans = input("Type 'engage' + Enter to start leader-follower tracking: ").strip()
+    try:
+        ans = input("Type 'engage' + Enter to start leader-follower tracking: ").strip()
+    except KeyboardInterrupt:
+        ans = ""
     if ans.lower() != "engage":
         print("Not engaging. Re-stiffening."); restiffen(); time.sleep(0.3); return 0
 
-    # ---- Clutch ----
     qf0, ql0 = q_of(follower), q_of(leader)
     xf0_pos, Rf0 = kin.fk(qf0)
     xl0_pos, Rl0 = kin.fk(ql0)
@@ -233,11 +335,24 @@ def main() -> int:
         kd_full[gripper_index] = stock_kd[gripper_index]
 
     tau_total_clip = tau_clip_vec + fp.fric_max
-    t_engage = time.perf_counter()
+    cfg = {
+        "K_trans": np.round(K[:3], 1).tolist(), "K_rot": np.round(K[3:], 1).tolist(),
+        "D": np.round(D, 1).tolist(), "tau_clip": np.round(tau_clip_vec, 1).tolist(),
+        "friction": "ON" if fric_on else "OFF", "mu_c(eff)": np.round(fp.mu_c, 2).tolist(),
+        "fric_max": np.round(fp.fric_max, 1).tolist(), "kd": np.round(arm_kd, 1).tolist(),
+        "v_eps": np.round(fp.v_eps, 3).tolist(),
+        "max_vel": args.max_vel, "workspace_m": args.workspace, "mu_scale": args.mu_scale,
+    }
+    rec = {k: [] for k in ("t", "ql", "qf", "xl", "xf", "perr", "rerr", "ti", "tf", "qd")}
+    ended = "normal"
+
     print(f"\n[Phase B] TRACKING (friction {'ON' if fric_on else 'OFF'}). Move the LEADER; follower follows.")
-    print(f"  follower start EE {np.round(xf0_pos,3)}  (x_des clamped +-{args.workspace} m)")
-    dt = 1.0 / max(args.rate, 0.5)
-    next_log = time.perf_counter()
+    print(f"  follower start EE {np.round(xf0_pos,3)}  (x_des clamped +-{args.workspace} m). Ctrl-C to stop.")
+    t0 = time.perf_counter()
+    dt_print = 1.0 / max(args.rate, 0.5)
+    dt_log = 1.0 / max(args.log_rate, 1.0)
+    next_print = t0
+    next_logrec = t0
     try:
         while True:
             ql = q_of(leader)
@@ -256,7 +371,7 @@ def main() -> int:
 
             tau_imp = np.clip(J.T @ F, -tau_clip_vec, tau_clip_vec)
             if fric_on:
-                enable = min(1.0, (time.perf_counter() - t_engage) / max(args.fric_ramp, 1e-3))
+                enable = min(1.0, (time.perf_counter() - t0) / max(args.fric_ramp, 1e-3))
                 tau_fric = friction_torque(qdf, tau_imp, fp, enable)
             else:
                 tau_fric = np.zeros(ARM_DOF)
@@ -265,6 +380,7 @@ def main() -> int:
             track = np.linalg.norm(dx[:3])
             if track > args.max_track or np.any(np.abs(qdf) > args.max_vel):
                 print(f"\n!! GUARD: track_err={track*100:.1f}cm  max_vel={np.abs(qdf).max():.2f} — re-stiffening.")
+                ended = "guard"
                 restiffen(); break
 
             torque_full = np.zeros(n_motors)
@@ -272,23 +388,30 @@ def main() -> int:
             follower.command_joint_torque(torque_full, kp=kp_full, kd=kd_full, pos=full_pos)
 
             now = time.perf_counter()
-            if now >= next_log:
-                viol = check_budget(tau_imp, tau_fric, GRAVITY_MAX, arm_kd, qdf)
+            if now >= next_logrec:
+                rec["t"].append(now - t0)
+                rec["ql"].append(ql.copy()); rec["qf"].append(qf.copy())
+                rec["xl"].append(xl_pos.copy()); rec["xf"].append(xf_pos.copy())
+                rec["perr"].append(dx[:3].copy()); rec["rerr"].append(dx[3:].copy())
+                rec["ti"].append(tau_imp.copy()); rec["tf"].append(tau_fric.copy()); rec["qd"].append(qdf.copy())
+                next_logrec = now + dt_log
+            if now >= next_print:
                 print("-" * 72)
-                print(f"leader EE {np.round(xl_pos,3)}  x_des {np.round(x_des_pos,3)}  track_err {track*100:5.1f} cm")
-                print(f"follow EE {np.round(xf_pos,3)}")
-                print(f"tau_imp  {np.round(tau_imp,2)}")
-                print(f"tau_fric {np.round(tau_fric,2)}")
-                if viol:
-                    print("  !! budget: " + "; ".join(viol))
-                next_log = now + dt
+                print(f"leader EE {np.round(xl_pos,3)}  track_err {track*100:5.1f} cm")
+                print(f"tau_imp  {np.round(tau_imp,2)}   tau_fric {np.round(tau_fric,2)}")
+                next_print = now + dt_print
             time.sleep(0.005)
     except KeyboardInterrupt:
         print("\nCtrl-C — re-stiffening follower.")
+        ended = "ctrl-c"
         restiffen()
 
+    write_summary(args.log, cfg, rec, tau_clip_vec, fric_on, ended)
     print("\nDone. Follower in stiff hold. SUPPORT BOTH ARMS — they relax when this exits.")
-    input("Press Enter to exit (keep holding the arms)...")
+    try:
+        input("Press Enter to exit (keep holding the arms)...")
+    except KeyboardInterrupt:
+        pass
     return 0
 
 

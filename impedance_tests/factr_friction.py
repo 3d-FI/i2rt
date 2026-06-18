@@ -66,14 +66,17 @@ class FrictionParams:
 
 
 def default_yam_params() -> FrictionParams:
-    """Conservative starting point. mu_c should be REPLACED by calibrated values
-    (test_05_friction_calibrate.py) scaled by ~0.5 before trusting it on the heavy joints.
+    """Tuned on the YAM follower 2026-06-18 (leader-follower iter6 — smooth, stable, no
+    limit cycle). mu_c is RAW; effective = mu_c * mu_scale (test_06 default mu_scale=0.5
+    -> eff [0.5, 2.4, 2.6, 0.5, 0.13, 0.11]). v_eps=0.15 keeps the velocity-comp slope
+    gentle so the heavy joints break loose when loaded without limit-cycling at light
+    poses. Re-run test_05_friction_calibrate.py if the arm or end-effector payload changes.
     """
     return FrictionParams(
         #       base shoulder elbow  wp    wy    wr
-        mu_c=  [0.8,  1.2,    1.2,   0.4,  0.3,  0.3],
+        mu_c=  [1.0,  4.8,    5.2,   1.0,  0.25, 0.22],
         mu_v=  [0.0,  0.0,    0.0,   0.0,  0.0,  0.0],
-        v_eps= [0.05, 0.05,   0.05,  0.05, 0.05, 0.05],
+        v_eps= [0.15, 0.15,   0.15,  0.15, 0.15, 0.15],
         t_eps= [0.3,  0.5,    0.5,   0.2,  0.2,  0.2],
         fric_max=[1.5, 3.0,   3.0,   1.0,  1.0,  1.0],
     )
