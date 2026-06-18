@@ -50,6 +50,7 @@ def get_yam_robot(
 
     motor_directions = [1, 1, 1, 1, 1, 1]
     kp = np.array([80, 80, 80, 40, 10, 10])
+    gravity_comp_factor = np.array([1.3, 1.3, 1.3, 1.15, 1.3, 1.3])
     kd = np.array([5, 5, 5, 1.5, 1.5, 1.5])
     if with_gripper:
         motor_type = gripper_type.get_motor_type()
@@ -63,6 +64,7 @@ def get_yam_robot(
         motor_directions.append(1)
         kp = np.concatenate([kp, np.array([gripper_kp])])
         kd = np.concatenate([kd, np.array([gripper_kd])])
+        gravity_comp_factor = np.concatenate([gravity_comp_factor, np.array([1.0])])
 
     motor_chain = DMChainCanInterface(
         motor_list,
@@ -113,7 +115,7 @@ def get_yam_robot(
         motor_chain=motor_chain,
         xml_path=model_path,
         use_gravity_comp=True,
-        gravity_comp_factor=1.3,
+        gravity_comp_factor=gravity_comp_factor,
         joint_limits=joint_limits,
         kp=kp,
         kd=kd,
@@ -126,7 +128,7 @@ def get_yam_robot(
             gripper_limits=gripper_type.get_gripper_limits(),
             enable_gripper_calibration=gripper_type.get_gripper_needs_calibration(),
             gripper_type=gripper_type,
-            limit_gripper_force=50.0,
+            limit_gripper_force=10.0,
         )
     else:
         return get_robot()
