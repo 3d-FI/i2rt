@@ -54,10 +54,15 @@ class LeaderFollowerImpedance:
         vel_ff_alpha: float = 0.3,
         ki: float = 0.0,
         ei_clip: float = 0.1,
+        pose_source=None,
     ):
         self.follower = follower
         self.leader = leader
         self.name = name
+        # SpaceMouse (or any) pose source: if set, the desired EE pose comes from
+        # pose_source.get_pose() -> (pos(3), R(3x3), grip) instead of a leader arm. No leader
+        # joints exist in this mode, so the leader-velocity feedforward is skipped.
+        self.pose_source = pose_source
         self.kin = MjKin(xml_path)
         # Leader-velocity feedforward (cuts velocity-proportional following lag):
         #   vel_ff    - gain on leader joint-velocity feedforward torque (0 = off)
@@ -119,6 +124,20 @@ class LeaderFollowerImpedance:
             grip = float(g[0]) if g.size else None
         return q, qd, grip
 
+    def _target_pose(self):
+        """Desired EE pose + gripper (+ leader joints/velocity) for this tick.
+
+        From the SpaceMouse pose_source if set (no leader arm; ql/qld are None, so the
+        leader-velocity feedforward is skipped), else from the leader arm via FK.
+        Returns (xl_pos(3), Rl(3x3), grip, ql|None, qld|None).
+        """
+        if self.pose_source is not None:
+            pos, R, grip = self.pose_source.get_pose()
+            return np.asarray(pos, float), np.asarray(R, float), grip, None, None
+        ql, qld, grip = self._leader_arm_grip()
+        xl_pos, Rl = self.kin.fk(ql)
+        return xl_pos, Rl, grip, ql, qld
+
     def restiffen(self):
         try:
             self.follower.update_kp_kd(self.stock_kp, self.stock_kd)
@@ -127,11 +146,10 @@ class LeaderFollowerImpedance:
             print(f"[{self.name}] restiffen warning: {e}")
 
     def _clutch(self):
-        """Capture the offset so the follower does not lunge to match the leader."""
+        """Capture the offset so the follower does not lunge to match the target."""
         qf, _ = self._follower_arm()
-        ql, _, _ = self._leader_arm_grip()
+        xl_pos, Rl, _, _, _ = self._target_pose()
         xf_pos, Rf = self.kin.fk(qf)
-        xl_pos, Rl = self.kin.fk(ql)
         self.pos_offset = xf_pos - xl_pos
         self.R_offset = Rl.T @ Rf
         self.box_lo = xf_pos - self.workspace
@@ -159,20 +177,21 @@ class LeaderFollowerImpedance:
             kd_full[self.gripper_index] = self.stock_kd[self.gripper_index]
 
         self._clutch()
-        print(f"[{self.name}] impedance engaged (clutched). Move the leader; follower tracks.")
+        src = "SpaceMouse" if self.pose_source is not None else "leader"
+        print(f"[{self.name}] impedance engaged (clutched). Move the {src}; follower tracks.")
         while not self._stop.is_set():
             _iter_t = time.perf_counter()
             try:
-                ql, qld, grip = self._leader_arm_grip()
-                # EMA-filter the (encoder-derivative-noisy) leader joint velocity for feedforward.
-                self._vl_filt = (1.0 - self.vel_ff_alpha) * self._vl_filt + self.vel_ff_alpha * qld
-                qld_f = self._vl_filt
-
-                xl_pos, Rl = self.kin.fk(ql)
-                # Predictive target: advance the goal by leader EE velocity * lookahead so the
-                # spring pulls toward where the leader is heading -> cancels velocity-prop lag.
-                if self.lookahead > 0.0:
-                    xl_pos = xl_pos + (self.kin.jacobian(ql) @ qld_f)[:3] * self.lookahead
+                xl_pos, Rl, grip, ql, qld = self._target_pose()
+                if qld is not None:
+                    # Leader mode: EMA-filter the noisy leader velocity for feedforward, and
+                    # advance the goal by leader EE velocity * lookahead (cancels velocity-prop lag).
+                    self._vl_filt = (1.0 - self.vel_ff_alpha) * self._vl_filt + self.vel_ff_alpha * qld
+                    qld_f = self._vl_filt
+                    if self.lookahead > 0.0:
+                        xl_pos = xl_pos + (self.kin.jacobian(ql) @ qld_f)[:3] * self.lookahead
+                else:
+                    qld_f = None  # pose_source (SpaceMouse): no leader velocity -> no feedforward
                 x_des_pos = np.clip(xl_pos + self.pos_offset, self.box_lo, self.box_hi)
                 R_des = Rl @ self.R_offset
 
@@ -195,7 +214,7 @@ class LeaderFollowerImpedance:
                 # Leader-velocity feedforward: net follower velocity term becomes
                 # arm_kd*(vel_ff*q̇_leader - q̇_follower) instead of arm_kd*(-q̇_follower), i.e. the
                 # follower actively matches the leader's joint velocity rather than only self-damping.
-                tau_velff = self.vel_ff * self.arm_kd * qld_f if self.vel_ff > 0.0 else 0.0
+                tau_velff = self.vel_ff * self.arm_kd * qld_f if (qld_f is not None and self.vel_ff > 0.0) else 0.0
                 tau_arm = np.clip(tau_imp + tau_fric + tau_velff, -self.tau_total_clip, self.tau_total_clip)
 
                 track = np.linalg.norm(dx[:3])
