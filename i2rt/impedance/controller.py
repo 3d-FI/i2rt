@@ -49,11 +49,30 @@ class LeaderFollowerImpedance:
         workspace: float = 0.25,
         fric_ramp: float = 2.0,
         rate_hz: float = 250.0,
+        vel_ff: float = 0.0,
+        lookahead: float = 0.0,
+        vel_ff_alpha: float = 0.3,
+        ki: float = 0.0,
+        ei_clip: float = 0.1,
     ):
         self.follower = follower
         self.leader = leader
         self.name = name
         self.kin = MjKin(xml_path)
+        # Leader-velocity feedforward (cuts velocity-proportional following lag):
+        #   vel_ff    - gain on leader joint-velocity feedforward torque (0 = off)
+        #   lookahead - seconds to advance the Cartesian target by leader EE velocity (0 = off)
+        #   vel_ff_alpha - EMA weight smoothing the (noisy) leader velocity
+        self.vel_ff = float(vel_ff)
+        self.lookahead = float(lookahead)
+        self.vel_ff_alpha = float(np.clip(vel_ff_alpha, 0.0, 1.0))
+        self._vl_filt = np.zeros(ARM_DOF)
+        # Integral term on the Cartesian pose error: removes the steady-state offset a PD
+        # spring leaves (gravity-comp residual + friction), so the follower exactly repeats
+        # the leader. ei_clip is the anti-windup clamp on the accumulated error.
+        self.Ki = float(ki)
+        self.ei_clip = float(ei_clip)
+        self._ei = np.zeros(6)
         self.K = np.asarray(K, float)
         self.D = np.asarray(D, float)
         self.arm_kd = np.asarray(arm_kd, float)
@@ -93,11 +112,12 @@ class LeaderFollowerImpedance:
     def _leader_arm_grip(self):
         obs = self.leader.get_observations()
         q = np.asarray(obs["joint_pos"], float)[:ARM_DOF]
+        qd = np.asarray(obs.get("joint_vel", np.zeros(ARM_DOF)), float)[:ARM_DOF]
         grip = None
         if "gripper_pos" in obs:
             g = np.asarray(obs["gripper_pos"], float).ravel()
             grip = float(g[0]) if g.size else None
-        return q, grip
+        return q, qd, grip
 
     def restiffen(self):
         try:
@@ -109,7 +129,7 @@ class LeaderFollowerImpedance:
     def _clutch(self):
         """Capture the offset so the follower does not lunge to match the leader."""
         qf, _ = self._follower_arm()
-        ql, _ = self._leader_arm_grip()
+        ql, _, _ = self._leader_arm_grip()
         xf_pos, Rf = self.kin.fk(qf)
         xl_pos, Rl = self.kin.fk(ql)
         self.pos_offset = xf_pos - xl_pos
@@ -117,6 +137,7 @@ class LeaderFollowerImpedance:
         self.box_lo = xf_pos - self.workspace
         self.box_hi = xf_pos + self.workspace
         self.t_engage = time.perf_counter()
+        self._ei = np.zeros(6)  # reset integral so a re-clutch never carries stale accumulation
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"impedance_{self.name}")
@@ -140,9 +161,18 @@ class LeaderFollowerImpedance:
         self._clutch()
         print(f"[{self.name}] impedance engaged (clutched). Move the leader; follower tracks.")
         while not self._stop.is_set():
+            _iter_t = time.perf_counter()
             try:
-                ql, grip = self._leader_arm_grip()
+                ql, qld, grip = self._leader_arm_grip()
+                # EMA-filter the (encoder-derivative-noisy) leader joint velocity for feedforward.
+                self._vl_filt = (1.0 - self.vel_ff_alpha) * self._vl_filt + self.vel_ff_alpha * qld
+                qld_f = self._vl_filt
+
                 xl_pos, Rl = self.kin.fk(ql)
+                # Predictive target: advance the goal by leader EE velocity * lookahead so the
+                # spring pulls toward where the leader is heading -> cancels velocity-prop lag.
+                if self.lookahead > 0.0:
+                    xl_pos = xl_pos + (self.kin.jacobian(ql) @ qld_f)[:3] * self.lookahead
                 x_des_pos = np.clip(xl_pos + self.pos_offset, self.box_lo, self.box_hi)
                 R_des = Rl @ self.R_offset
 
@@ -151,14 +181,22 @@ class LeaderFollowerImpedance:
                 J = self.kin.jacobian(qf)
                 xdot = J @ qdf
                 dx = self.kin.pose_error(x_des_pos, R_des, qf)
-                F = self.K * dx - self.D * xdot
+                if self.Ki > 0.0:
+                    self._ei = np.clip(self._ei + dx * self.dt, -self.ei_clip, self.ei_clip)
+                    F = self.K * dx + self.Ki * self._ei - self.D * xdot
+                else:
+                    F = self.K * dx - self.D * xdot
                 tau_imp = np.clip(J.T @ F, -self.tau_clip, self.tau_clip)
                 if self.friction:
                     enable = min(1.0, (time.perf_counter() - self.t_engage) / max(self.fric_ramp, 1e-3))
                     tau_fric = friction_torque(qdf, tau_imp, self.fp, enable)
                 else:
                     tau_fric = np.zeros(ARM_DOF)
-                tau_arm = np.clip(tau_imp + tau_fric, -self.tau_total_clip, self.tau_total_clip)
+                # Leader-velocity feedforward: net follower velocity term becomes
+                # arm_kd*(vel_ff*q̇_leader - q̇_follower) instead of arm_kd*(-q̇_follower), i.e. the
+                # follower actively matches the leader's joint velocity rather than only self-damping.
+                tau_velff = self.vel_ff * self.arm_kd * qld_f if self.vel_ff > 0.0 else 0.0
+                tau_arm = np.clip(tau_imp + tau_fric + tau_velff, -self.tau_total_clip, self.tau_total_clip)
 
                 track = np.linalg.norm(dx[:3])
                 if track > self.max_track or np.any(np.abs(qdf) > self.max_vel):
@@ -180,5 +218,7 @@ class LeaderFollowerImpedance:
                 self.restiffen()
                 time.sleep(0.2)
                 self._clutch()
-            time.sleep(self.dt)
+            # Rate-compensated pacing: sleep only the remainder of the period so the loop
+            # holds rate_hz (250Hz) instead of always adding a full dt on top of the work.
+            time.sleep(max(0.0, self.dt - (time.perf_counter() - _iter_t)))
         print(f"[{self.name}] impedance stopped.")
