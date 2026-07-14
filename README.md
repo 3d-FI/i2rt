@@ -166,6 +166,15 @@ Run for each motor ID (1–6 for a standard YAM).
 
 Pull requests welcome. Open an issue to request examples or report bugs.
 
+## CI
+
+Every PR to `main` runs two workflows:
+
+- **ruff_CI** — runs `ruff check` for linting
+- **unit_tests_CI** — installs the package and runs `pytest`
+
+To add a new check, edit the workflow files in `.github/workflows/`.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE).
